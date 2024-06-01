@@ -1,5 +1,5 @@
 import torch
-from transformers import pipeline,AutoModelForSeq2SeqLM, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, AutoTokenizer
+from transformers import pipeline,AutoModelForSeq2SeqLM, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, AutoTokenizer, AdamW
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
 
@@ -7,13 +7,6 @@ from peft import LoraConfig, get_peft_model
 
 
 model_name = 'doc2query/msmarco-14langs-mt5-base-v1'
-
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True, # loading in 4 bit 
-    bnb_4bit_quant_type="nf4", # quantization type
-    bnb_4bit_use_double_quant=True, # nested quantization 
-    bnb_4bit_compute_dtype=torch.bfloat16,
-)
 
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
@@ -29,6 +22,7 @@ model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
 # PEFT and Lora
 dataset_name = 'thetian11/slosquad' 
 dataset = load_dataset(dataset_name, split="train")
+
 
 
 print(dataset['context'][0])
@@ -47,7 +41,17 @@ peft_config = LoraConfig(
     task_type="SEQ_2_SEQ_LM"
 )
 
+def preprocess_function2(examples):
+    inputs = [doc for doc in examples["context"]]
+    model_inputs = tokenizer(inputs, max_length=1024, truncation=True)
+    labels = tokenizer(text_target=examples["question"], max_length=128, truncation=True)
 
+    model_inputs["labels"] = labels["input_ids"]
+    return model_inputs
+
+
+dataset =  dataset.train_test_split(test_size=0.2)
+tokenized_dataset = dataset.map(preprocess_function2, batched=True)
 
 def print_trainable_parameters(model):
     """
@@ -77,7 +81,7 @@ from transformers import TrainingArguments
 output_dir = "./results"
 per_device_train_batch_size = 1
 gradient_accumulation_steps = 1
-optim = "paged_adamw_32bit" #specialization of the AdamW optimizer that enables efficient learning in LoRA setting.
+optim = "adamw_hf" #specialization of the AdamW optimizer that enables efficient learning in LoRA setting.
 save_steps = 100
 logging_steps = 10
 learning_rate = 2e-4
@@ -95,7 +99,7 @@ training_arguments = TrainingArguments(
     save_steps=save_steps,
     logging_steps=logging_steps,
     learning_rate=learning_rate,
-    fp16=True,
+    fp16=False,
     max_grad_norm=max_grad_norm,
     max_steps=max_steps,
     warmup_ratio=warmup_ratio,
@@ -110,10 +114,25 @@ max_seq_length = 512
 
 trainer = SFTTrainer(
     model=model,
-    train_dataset=dataset,
+    train_dataset=tokenized_dataset['train'],
     peft_config=peft_config,
-    dataset_text_field="context",
+    dataset_text_field="question",
     max_seq_length=max_seq_length,
     tokenizer=tokenizer,
     args=training_arguments,
 )
+
+print("Pred trainom")
+trainer.train()
+print("Po trainu")
+
+
+model_to_save = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model  # Take care of distributed/parallel training
+model_to_save.save_pretrained("outputs")
+
+print("Model saved")
+text = dataset['train']["context"][0]
+
+inputs = tokenizer(text, return_tensors="pt")
+outputs = model.generate(**inputs, max_new_tokens=500)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
